@@ -24,7 +24,8 @@ sys.path.append(os.path.normpath(os.path.join(SCRIPT_DIR, PACKAGE_PARENT)))
 
 # model-related
 from tools.objdet_models.resnet.models import fpn_resnet
-from tools.objdet_models.resnet.utils.evaluation_utils import decode, post_processing 
+from tools.objdet_models.resnet.utils.evaluation_utils import decode, post_processing
+from tools.objdet_models.resnet.utils.torch_utils import _sigmoid
 
 from tools.objdet_models.darknet.models.darknet2pytorch import Darknet as darknet
 from tools.objdet_models.darknet.utils.evaluation_utils import post_processing_v2
@@ -35,12 +36,13 @@ def load_configs_model(model_name='darknet', configs=None):
 
     # init config file, if none has been passed
     if configs==None:
-        configs = edict()  
+        configs = edict()
 
     # get parent directory of this file to enable relative paths
     curr_path = os.path.dirname(os.path.realpath(__file__))
-    parent_path = configs.model_path = os.path.abspath(os.path.join(curr_path, os.pardir))    
-    
+    parent_path = configs.model_path = os.path.abspath(os.path.join(curr_path, os.pardir))
+
+
     # set parameters according to model type
     if model_name == "darknet":
         configs.model_path = os.path.join(parent_path, 'tools', 'objdet_models', 'darknet')
@@ -48,7 +50,7 @@ def load_configs_model(model_name='darknet', configs=None):
         configs.arch = 'darknet'
         configs.batch_size = 4
         configs.cfgfile = os.path.join(configs.model_path, 'config', 'complex_yolov4.cfg')
-        configs.conf_thresh = 0.5
+        configs.conf_thresh = 0.8
         configs.distributed = False
         configs.img_size = 608
         configs.nms_thresh = 0.4
@@ -56,14 +58,43 @@ def load_configs_model(model_name='darknet', configs=None):
         configs.num_workers = 4
         configs.pin_memory = True
         configs.use_giou_loss = False
+        configs.min_iou = 0.5
 
     elif model_name == 'fpn_resnet':
-        ####### ID_S3_EX1-3 START #######     
+        # Clone https://github.com/maudzung/SFA3D
+        ####### ID_S3_EX1-3 START #######
         #######
         print("student task ID_S3_EX1-3")
+        configs.model_path = os.path.join(parent_path, 'tools', 'objdet_models', 'resnet')
+        configs.pretrained_filename = os.path.join(configs.model_path, 'pretrained', 'fpn_resnet_18_epoch_300.pth')
+        configs.arch = 'fpn_resnet'
+        configs.conf_thresh = 0.5
+        configs.num_layers = 18
 
+        configs.imagenet_pretrained = False
+        configs.head_conv = 64
+        configs.num_classes = 3
+        configs.num_center_offset = 2
+        configs.num_z = 1
+        configs.num_dim = 3
+        configs.num_direction = 2  # sin, cos
+
+        configs.heads = {
+            'hm_cen': configs.num_classes,
+            'cen_offset': configs.num_center_offset,
+            'direction': configs.num_direction,
+            'z_coor': configs.num_z,
+            'dim': configs.num_dim
+        }
+
+        configs.down_ratio = 4
+        configs.min_iou = 0.5
+
+
+        # configs.device = torch.device('cuda:1')
+        configs.device = torch.device('cpu')
         #######
-        ####### ID_S3_EX1-3 END #######     
+        ####### ID_S3_EX1-3 END #######
 
     else:
         raise ValueError("Error: Invalid model name")
@@ -81,7 +112,7 @@ def load_configs(model_name='fpn_resnet', configs=None):
 
     # init config file, if none has been passed
     if configs==None:
-        configs = edict()    
+        configs = edict()
 
     # birds-eye view (bev) parameters
     configs.lim_x = [0, 50] # detection range in m
@@ -89,7 +120,7 @@ def load_configs(model_name='fpn_resnet', configs=None):
     configs.lim_z = [-1, 3]
     configs.lim_r = [0, 1.0] # reflected lidar intensity
     configs.bev_width = 608  # pixel resolution of bev image
-    configs.bev_height = 608 
+    configs.bev_height = 608
 
     # add model-dependent parameters
     configs = load_configs_model(model_name, configs)
@@ -110,18 +141,20 @@ def create_model(configs):
     # create model depending on architecture name
     if (configs.arch == 'darknet') and (configs.cfgfile is not None):
         print('using darknet')
-        model = darknet(cfgfile=configs.cfgfile, use_giou_loss=configs.use_giou_loss)    
-    
+        model = darknet(cfgfile=configs.cfgfile, use_giou_loss=configs.use_giou_loss)
+
     elif 'fpn_resnet' in configs.arch:
         print('using ResNet architecture with feature pyramid')
-        
-        ####### ID_S3_EX1-4 START #######     
+
+        ####### ID_S3_EX1-4 START #######
         #######
         print("student task ID_S3_EX1-4")
+        model = fpn_resnet.get_pose_net(num_layers=configs.num_layers, heads=configs.heads, head_conv=configs.head_conv,
+                            imagenet_pretrained=configs.imagenet_pretrained)
 
         #######
-        ####### ID_S3_EX1-4 END #######     
-    
+        ####### ID_S3_EX1-4 END #######
+
     else:
         assert False, 'Undefined model backbone'
 
@@ -132,7 +165,7 @@ def create_model(configs):
     # set model to evaluation state
     configs.device = torch.device('cpu' if configs.no_cuda else 'cuda:{}'.format(configs.gpu_idx))
     model = model.to(device=configs.device)  # load model to either cpu or gpu
-    model.eval()          
+    model.eval()
 
     return model
 
@@ -141,7 +174,7 @@ def create_model(configs):
 def detect_objects(input_bev_maps, model, configs):
 
     # deactivate autograd engine during test to reduce memory usage and speed up computations
-    with torch.no_grad():  
+    with torch.no_grad():
 
         # perform inference
         outputs = model(input_bev_maps)
@@ -150,7 +183,7 @@ def detect_objects(input_bev_maps, model, configs):
         if 'darknet' in configs.arch:
 
             # perform post-processing
-            output_post = post_processing_v2(outputs, conf_thresh=configs.conf_thresh, nms_thresh=configs.nms_thresh) 
+            output_post = post_processing_v2(outputs, conf_thresh=configs.conf_thresh, nms_thresh=configs.nms_thresh)
             detections = []
             for sample_i in range(len(output_post)):
                 if output_post[sample_i] is None:
@@ -159,36 +192,55 @@ def detect_objects(input_bev_maps, model, configs):
                 for obj in detection:
                     x, y, w, l, im, re, _, _, _ = obj
                     yaw = np.arctan2(im, re)
-                    detections.append([1, x, y, 0.0, 1.50, w, l, yaw])    
+                    detections.append([1, x.item(), y.item(), 0.0, 1.50, w.item(), l.item(), yaw.item()])
 
         elif 'fpn_resnet' in configs.arch:
             # decode output and perform post-processing
-            
-            ####### ID_S3_EX1-5 START #######     
+
+            ####### ID_S3_EX1-5 START #######
             #######
             print("student task ID_S3_EX1-5")
-
+            # SDF3D/sfa/utils/demo_utils.py
+            outputs['hm_cen'] = _sigmoid(outputs['hm_cen'])
+            outputs['cen_offset'] = _sigmoid(outputs['cen_offset'])
+            # detections size (batch_size, K, 10)
+            detections = decode(outputs['hm_cen'], outputs['cen_offset'], outputs['direction'], outputs['z_coor'],
+                                outputs['dim'], K=40) #K=configs.k
+            detections = detections.cpu().numpy().astype(np.float32)
+            # print(detections)
+            detections = post_processing(detections, configs)
+            detections = detections[0][1] # get class 1
             #######
-            ####### ID_S3_EX1-5 END #######     
+            ####### ID_S3_EX1-5 END #######
 
-            
 
-    ####### ID_S3_EX2 START #######     
+
+    ####### ID_S3_EX2 START #######
     #######
     # Extract 3d bounding boxes from model response
     print("student task ID_S3_EX2")
-    objects = [] 
+    objects = []
 
     ## step 1 : check whether there are any detections
-
+    for _, bev_x, bev_y, z, h, bev_w, bev_l, yaw in detections:
         ## step 2 : loop over all detections
-        
-            ## step 3 : perform the conversion using the limits for x, y and z set in the configs structure
-        
+
+        ## step 3 : perform the conversion using the limits for x, y and z set in the configs structure
+        x = bev_y / configs.bev_height * (configs.lim_x[1] - configs.lim_x[0])
+        y = bev_x / configs.bev_width * (configs.lim_y[1] - configs.lim_y[0]) - (configs.lim_y[1] - configs.lim_y[0])/2.0
+        w = bev_w / configs.bev_width * (configs.lim_y[1] - configs.lim_y[0])
+        l = bev_l / configs.bev_height * (configs.lim_x[1] - configs.lim_x[0])
+
+        ## step 4 : append the current object to the 'objects' array
+        if ((x >= configs.lim_x[0]) and (x <= configs.lim_x[1])
+            and (y >= configs.lim_y[0]) and (y <= configs.lim_y[1])
+            and (z >= configs.lim_z[0]) and (z <= configs.lim_z[1])):
+
             ## step 4 : append the current object to the 'objects' array
-        
+            objects.append([1, x, y, z, h, w, l, yaw])
+
     #######
-    ####### ID_S3_EX2 START #######   
-    
-    return objects    
+    ####### ID_S3_EX2 START #######
+
+    return objects
 
